@@ -28,18 +28,39 @@ type JsonValue =
   | JsonValue[]
   | { [key: string]: JsonValue };
 
+type HotelStateRow = {
+  state_data: JsonValue;
+  version: number | string | null;
+  updated_at: string | null;
+};
+
+async function getAdminDb() {
+  if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+    return null;
+  }
+
+  const { supabaseAdmin } = await import(
+    "@/integrations/supabase/client.server"
+  );
+
+  return supabaseAdmin as any;
+}
+
+function toStateResult(row: HotelStateRow) {
+  return {
+    stateData: row.state_data as JsonValue,
+    version: Number(row.version ?? 0),
+    updatedAt: String(row.updated_at ?? ""),
+  };
+}
+
 export const getHotelState = createServerFn({ method: "GET" })
   .inputValidator((input) => getStateSchema.parse(input))
   .handler(async ({ data }) => {
-    if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
-      return null;
-    }
+    const db = await getAdminDb();
+    if (!db) return null;
 
-    const { supabaseAdmin } = await import(
-      "@/integrations/supabase/client.server"
-    );
-
-    const { data: row, error } = await supabaseAdmin
+    const { data: row, error } = await db
       .from("hotel_app_state")
       .select("state_data, version, updated_at")
       .eq("state_key", data.key)
@@ -48,17 +69,14 @@ export const getHotelState = createServerFn({ method: "GET" })
     if (error) throw new Error(error.message);
     if (!row) return null;
 
-    return {
-      stateData: row.state_data as JsonValue,
-      version: Number(row.version ?? 0),
-      updatedAt: String(row.updated_at ?? ""),
-    };
+    return toStateResult(row as HotelStateRow);
   });
 
 export const setHotelState = createServerFn({ method: "POST" })
   .inputValidator((input) => setStateSchema.parse(input))
   .handler(async ({ data }) => {
-    if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+    const db = await getAdminDb();
+    if (!db) {
       return {
         stateData: data.stateData as JsonValue,
         version: 0,
@@ -66,11 +84,7 @@ export const setHotelState = createServerFn({ method: "POST" })
       };
     }
 
-    const { supabaseAdmin } = await import(
-      "@/integrations/supabase/client.server"
-    );
-
-    const { data: row, error } = await supabaseAdmin
+    const { data: row, error } = await db
       .from("hotel_app_state")
       .upsert(
         {
@@ -79,16 +93,12 @@ export const setHotelState = createServerFn({ method: "POST" })
         },
         {
           onConflict: "state_key",
-        }
+        },
       )
       .select("state_data, version, updated_at")
       .single();
 
     if (error) throw new Error(error.message);
 
-    return {
-      stateData: row.state_data as JsonValue,
-      version: Number(row.version ?? 0),
-      updatedAt: String(row.updated_at ?? ""),
-    };
+    return toStateResult(row as HotelStateRow);
   });
