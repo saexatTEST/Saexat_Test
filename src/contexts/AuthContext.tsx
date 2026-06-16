@@ -73,15 +73,32 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [ready, setReady] = useState(false);
   const [user, setUser] = useState<AuthUser | null>(null);
 
-  const [history, setHistory] = useState<LoginEvent[]>(() => loadHistory());
+   const [history, setHistory] = useState<LoginEvent[]>(() => loadHistory());
+  const getSharedState = useServerFn(getHotelState);
+  const setSharedState = useServerFn(setHotelState);
+  const cloudWriteRef = useRef<number | null>(null);
+  const lastCloudVersionRef = useRef(0);
+  const historyRef = useRef<LoginEvent[]>(history);
+  historyRef.current = history;
+
+  const pushHistoryCloud = useCallback((next: LoginEvent[]) => {
+    if (typeof window === "undefined") return;
+    if (cloudWriteRef.current) window.clearTimeout(cloudWriteRef.current);
+    cloudWriteRef.current = window.setTimeout(() => {
+      void setSharedState({ data: { key: "auth-history", stateData: next } })
+        .then((row) => {
+          if (row && typeof row.version === "number") lastCloudVersionRef.current = row.version;
+          cloudWriteRef.current = null;
+        })
+        .catch(() => undefined);
+    }, 120);
+  }, [setSharedState]);
 
   useEffect(() => {
     try {
-      // Session-only persistence: closing the tab clears the session so the user must re-enter credentials.
       const raw = sessionStorage.getItem(STORAGE_KEY);
       const parsed = raw ? (JSON.parse(raw) as AuthUser) : null;
       setUser(parsed ? { ...parsed, canSwitchWorkspaces: parsed.canSwitchWorkspaces || parsed.username === "superuser" } : null);
-      // Clean up any legacy persisted session from localStorage.
       try { localStorage.removeItem(STORAGE_KEY); } catch { /* ignore */ }
     } catch {
       setUser(null);
@@ -95,9 +112,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     else sessionStorage.removeItem(STORAGE_KEY);
   }, [user]);
 
-  // Auto-logout when the browser/tab is closed: record a logout history
-  // entry for the currently signed-in user and clear their session.
-  // `pagehide` fires reliably on tab/window close in all modern browsers.
   useEffect(() => {
     if (typeof window === "undefined") return;
     const handler = () => {
@@ -111,6 +125,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           adminId: user.adminId,
           displayName: user.displayName,
         });
+        const next = loadHistory();
+        setHistory(next);
+        pushHistoryCloud(next);
       } catch { /* ignore */ }
       try { sessionStorage.removeItem(STORAGE_KEY); } catch { /* ignore */ }
     };
@@ -120,7 +137,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       window.removeEventListener("pagehide", handler);
       window.removeEventListener("beforeunload", handler);
     };
-  }, [user]);
+  }, [user, pushHistoryCloud]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -135,6 +152,33 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       window.removeEventListener(HISTORY_EVENT, refresh as EventListener);
     };
   }, []);
+
+  // Cloud poll — share login/logout history across every device.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    let cancelled = false;
+    const loadCloud = async () => {
+      try {
+        const row = await getSharedState({ data: { key: "auth-history" } });
+        if (cancelled || !row?.stateData) return;
+        if (row.version <= lastCloudVersionRef.current || cloudWriteRef.current) return;
+        lastCloudVersionRef.current = row.version;
+        const remote = Array.isArray(row.stateData) ? (row.stateData as LoginEvent[]) : [];
+        const byId = new Map<string, LoginEvent>();
+        for (const ev of [...historyRef.current, ...remote]) byId.set(ev.id, ev);
+        const merged = Array.from(byId.values())
+          .sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : 0))
+          .slice(0, 500);
+        setHistory(merged);
+        window.localStorage.setItem(HISTORY_KEY, JSON.stringify(merged));
+        window.dispatchEvent(new Event(HISTORY_EVENT));
+      } catch { /* keep local */ }
+    };
+    loadCloud();
+    const id = window.setInterval(loadCloud, 2000);
+    return () => { cancelled = true; window.clearInterval(id); };
+  }, [getSharedState]);
+
 
   const login: AuthContextValue["login"] = useCallback(
     (username, password) => {
